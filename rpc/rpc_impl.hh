@@ -445,6 +445,7 @@ inline future<> reply(wait_type, future<RetTypes...>&& ret, int64_t msg_id, lw_s
 
         return client->respond(msg_id, std::move(data), timeout);
     } else {
+        ret.ignore_ready_future();
         return make_ready_future<>();
     }
 }
@@ -1053,10 +1054,7 @@ protocol<Serializer, MsgType>::client::client(protocol& proto, client_options op
             fd.set_keepalive(true);
             fd.set_keepalive_parameters(ops.keepalive.value());
         }
-        this->_fd = std::move(fd);
-        this->_read_buf = this->_fd.input();
-        this->_write_buf = this->_fd.output();
-        this->_connected = true;
+        this->set_socket(std::move(fd));
 
         feature_map features;
         if (_options.compressor_factory) {
@@ -1086,7 +1084,8 @@ protocol<Serializer, MsgType>::client::client(protocol& proto, client_options op
                             // can happen if unknown verb was used by no_wait client
                             this->get_protocol().log(this->peer_address(), sprint("unknown verb exception %d ignored", ex.type));
                         } catch(...) {
-                            this->_error = true;
+                            // We've got error response but handler is no longer waiting, could be timed out.
+                            log_exception(*this, "ignoring error response", std::current_exception());
                         }
                     } else {
                         // we get a reply for a message id not in _outstanding
@@ -1098,7 +1097,7 @@ protocol<Serializer, MsgType>::client::client(protocol& proto, client_options op
         });
     }).then_wrapped([this] (future<> f) {
         if (f.failed()) {
-            log_exception(*this, _connected ? "client connection dropped" : "fail to connect", f.get_exception());
+            log_exception(*this, this->_connected ? "client connection dropped" : "fail to connect", f.get_exception());
         }
         this->_error = true;
         this->stop_send_loop().then_wrapped([this] (future<> f) {

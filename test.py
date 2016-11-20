@@ -37,11 +37,13 @@ boost_tests = [
     'foreign_ptr_test',
     'semaphore_test',
     'shared_ptr_test',
+    'weak_ptr_test',
     'fileiotest',
     'packet_test',
     'tls_test',
     'rpc_test',
     'connect_test',
+    'json_formatter_test',
 ]
 
 other_tests = [

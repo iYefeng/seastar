@@ -65,7 +65,7 @@ static constexpr char rpc_magic[] = "SSTARRPC";
 struct resource_limits {
     size_t basic_request_size = 0; ///< Minimum request footprint in memory
     unsigned bloat_factor = 1;     ///< Serialized size multiplied by this to estimate memory used by request
-    size_t max_memory = std::numeric_limits<size_t>::max(); ///< Maximum amount of memory that may be consumed by all requests
+    size_t max_memory = semaphore::max_counter(); ///< Maximum amount of memory that may be consumed by all requests
 };
 
 struct client_options {
@@ -112,7 +112,9 @@ class protocol {
         input_stream<char> _read_buf;
         output_stream<char> _write_buf;
         bool _error = false;
+        bool _write_side_closed = false;
         protocol& _proto;
+        bool _connected = false;
         promise<> _stopped;
         stats _stats;
         struct outgoing_entry {
@@ -154,12 +156,14 @@ class protocol {
         future<> send_buffer(snd_buf buf) {
             auto* b = boost::get<temporary_buffer<char>>(&buf.bufs);
             if (b) {
-                return _write_buf.write(std::move(*b));
+                // zero-copy write() is lacking batching so using copying write(). Refs #213.
+                return _write_buf.write(b->get(), b->size());
             } else {
                 return do_with(std::move(boost::get<std::vector<temporary_buffer<char>>>(buf.bufs)),
                         [this] (std::vector<temporary_buffer<char>>& ar) {
                     return do_for_each(ar.begin(), ar.end(), [this] (auto& b) {
-                        return _write_buf.write(std::move(b));
+                        // zero-copy write() is lacking batching so using copying write(). Refs #213.
+                        return _write_buf.write(b.get(), b.size());
                     });
                 });
             }
@@ -196,6 +200,7 @@ class protocol {
                             write_le<uint64_t>(d.buf.front().get_write(), left);
                         } else {
                             d.buf.front().trim_front(8);
+                            d.buf.size -= 8;
                         }
                     }
                     d.buf = compress(std::move(d.buf));
@@ -208,15 +213,15 @@ class protocol {
             }).handle_exception([this] (std::exception_ptr eptr) {
                 _error = true;
             }).finally([this] {
+                _write_side_closed = true;
                 return _write_buf.close();
             });
         }
 
         future<> stop_send_loop() {
             _error = true;
-            if (!_send_loop_stopped.available()) {
-                // if _send_loop_stopped is ready it means that _fd is closed already
-                // and nobody waits on _outgoing_queue_cond
+            // We must not call shutdown_output() concurrently with or after _write_buf.close()
+            if (_connected && !_write_side_closed) {
                 _outgoing_queue_cond.broken();
                 _fd.shutdown_output();
             }
@@ -226,10 +231,20 @@ class protocol {
         }
 
     public:
-        connection(connected_socket&& fd, protocol& proto) : _fd(std::move(fd)), _read_buf(_fd.input()), _write_buf(_fd.output()), _proto(proto) {}
+        connection(connected_socket&& fd, protocol& proto) : _fd(std::move(fd)), _read_buf(_fd.input()), _write_buf(_fd.output()), _proto(proto), _connected(true) {}
         connection(protocol& proto) : _proto(proto) {}
+        void set_socket(connected_socket&& fd) {
+            if (_connected) {
+                throw std::runtime_error("already connected");
+            }
+            _fd = std::move(fd);
+            _read_buf =_fd.input();
+            _write_buf = _fd.output();
+            _connected = true;
+        }
         future<> send_negotiation_frame(temporary_buffer<char> buf) {
-            return _write_buf.write(std::move(buf)).then([this] {
+            // zero-copy write() is lacking batching so using copying write(). Refs #213.
+            return _write_buf.write(buf.get(), buf.size()).then([this] {
                 _stats.sent_messages++;
                 return _write_buf.flush();
             });
@@ -361,7 +376,6 @@ public:
     };
 
     class client : public protocol::connection {
-        bool _connected = false;
         ::seastar::socket _socket;
         id_type _message_id = 1;
         struct reply_handler_base {
